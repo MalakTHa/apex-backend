@@ -12,7 +12,7 @@ app.add_middleware(
     CORSMiddleware,
     #يعتمد CORSMiddleware على قيمة Origin المرسلة مع الطلب من المتصفح، حيث يقوم بمقارنتها مع القيم المسموح بها في allow_origins، فإذا كانت متطابقة يسمح بالاتصال، وإذا لم تكن كذلك يقوم المتصفح بمنع الاستجابة.
     #allow_origins=["*"],
-    allow_origins=["http://localhost:5173", "http://localhost:5175","https://apex-frontend-t4bd-ca8qw9s39-malak-s-projects4.vercel.app"],
+    allow_origins=["*"],
     allow_credentials=True,#باستخدامها بعدين لما اعمل تسجيل دخول وحفظ جلسات 
     allow_methods=["*"],#هذا يسمح بكل انوع الطلبات وقد اغيره لاني استخدم بس pos
     allow_headers=["*"],
