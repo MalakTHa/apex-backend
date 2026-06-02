@@ -1570,8 +1570,8 @@ def build_simulation_points(before_analysis, after_analysis, start_n, end_n, ste
         points.append(
             {
                 "n": n,
-                "original": round(original_ops / 100, 2),
-                "optimized": round(optimized_ops / 100, 2),
+                "original": round(original_ops / 100, 4),
+                "optimized": round(optimized_ops / 100, 4),
             }
         )
 
