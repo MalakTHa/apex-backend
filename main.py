@@ -2,9 +2,17 @@ import ast
 from platform import node
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import hashlib
+import hmac
+import secrets
+import json
+from typing import Literal
+from verification_service import verify_with_docker, interactive_case_limit
+from verification import VerificationResult
 import math #جديد
 import textwrap
+from ai_optimizer import suggest_ai_optimization
 
 app = FastAPI()#هنا انشأت متغير او اوبجكت من كلاس فاست اي بي اي 
 
@@ -947,12 +955,29 @@ class ReplacementPatternDetector(ast.NodeVisitor):
 
 class ReplacementEngine:
     def __init__(self, function_name):
+        self.pattern_applied = False
         self.function_name = function_name
         self.changes = []#قائمة الرسائل التي ستظهر في الواجهة تحت Changes Made.
         self.reason = ""#سبب اختيار التحسين.
         self.after_override = None#نستخدمه عندما نريد تعديل نتيجة التحليل بعد التحسين يدويًا، مثل وضع O(n) أو اسم الخوارزمية.
 
     def optimize(self, function_node):
+        """Track actual structural changes without changing trusted replacements."""
+        self.pattern_applied = False
+        original = ast.dump(function_node, include_attributes=False)
+        code = self._optimize_trusted(function_node)
+        try:
+            result = ast.parse(code)
+        except SyntaxError:
+            # Leave existing endpoint validation and return behavior intact.
+            return code
+        if len(result.body) == 1 and isinstance(result.body[0], ast.FunctionDef):
+            self.pattern_applied = (
+                ast.dump(result.body[0], include_attributes=False) != original
+            )
+        return code
+
+    def _optimize_trusted(self, function_node):
         detector = ReplacementPatternDetector()
         detector.visit(function_node)
 
@@ -1454,6 +1479,95 @@ def apply_after_override(after_analysis, override):
     return updated
 
 
+def build_ai_replacement_result(input, target_node, before_analysis):
+    """Build an unverified preview only; never execute or apply AI code."""
+    function_code, _ = extract_selected_function_source(input.code, input.function_name)
+    result = {
+        "function": input.function_name,
+        "optimization_type": "replacement",
+        "optimized_function_code": function_code,
+        "full_code": input.code,
+        "changes": [],
+        "before": before_analysis,
+        "after": dict(before_analysis),
+        "reason": "AI candidate generation failed.",
+        "optimization_source": "none",
+        "ai_used": True,
+        "verification_status": "ai_error",
+        "pattern_applied": False,
+        "error_code": "invalid_response",
+    }
+    try:
+        suggestion = suggest_ai_optimization(function_code, before_analysis)
+    except Exception:
+        # Defensive boundary: never expose SDK exceptions or secrets.
+        return {**result, "error_code": "request_failed"}
+
+    if not isinstance(suggestion, dict):
+        return result
+    if suggestion.get("status") == "error":
+        # ai_optimizer returns sanitized errors, never raw provider responses.
+        return {
+            **result, "reason": suggestion.get("reason", result["reason"]),
+            "error_code": suggestion.get("error_code") or "request_failed",
+        }
+    def no_further_optimization(reason=None):
+        return {
+            **result,
+            "reason": reason if isinstance(reason, str) and reason.strip()
+            else "No further optimization was found for this function.",
+            "verification_status": "not_applicable", "error_code": None,
+        }
+
+    if (suggestion.get("can_optimize") is False
+            or suggestion.get("status") in {"declined", "decline", "no_optimization", "not_applicable"}):
+        return no_further_optimization(suggestion.get("reason"))
+    if suggestion.get("status") != "candidate" or suggestion.get("can_optimize") is not True:
+        return result
+
+    try:
+        candidate_code = suggestion["optimized_function_code"]
+        candidate_tree = ast.parse(candidate_code)
+        if len(candidate_tree.body) != 1 or not isinstance(candidate_tree.body[0], ast.FunctionDef):
+            raise ValueError("Expected one function")
+        candidate_node = candidate_tree.body[0]
+        if candidate_node.name != target_node.name:
+            raise ValueError("Function name changed")
+        # Compare against the extracted source (outer decorators remain in full_code).
+        original_node = ast.parse(function_code).body[0]
+        if (
+            ast.dump(candidate_node.args) != ast.dump(original_node.args)
+            or [ast.dump(d) for d in candidate_node.decorator_list]
+            != [ast.dump(d) for d in original_node.decorator_list]
+            or (ast.dump(candidate_node.returns) if candidate_node.returns else None)
+            != (ast.dump(original_node.returns) if original_node.returns else None)
+            or [ast.dump(p) for p in getattr(candidate_node, "type_params", [])]
+            != [ast.dump(p) for p in getattr(original_node, "type_params", [])]
+        ):
+            raise ValueError("Function API changed")
+        # Ignore comments, formatting and source locations, not structural changes.
+        if ast.dump(original_node, include_attributes=False) == ast.dump(candidate_node, include_attributes=False):
+            return no_further_optimization()
+        candidate_full_code = replace_function_code(input.code, input.function_name, candidate_code)
+        ast.parse(candidate_full_code)
+        after_analysis = analyze_function_node(input.function_name, candidate_node)
+    except Exception:
+        return {**result, "error_code": "invalid_ai_candidate",
+                "reason": "AI candidate could not pass APEX structural analysis."}
+
+    return {
+        **result,
+        "optimized_function_code": candidate_code,
+        "full_code": candidate_full_code,
+        "after": after_analysis,
+        "reason": suggestion.get("reason", "AI generated a candidate for review."),
+        "changes": ["AI candidate generated for review; behavioral equivalence has not been checked."],
+        "optimization_source": "ai",
+        "verification_status": "not_verified",
+        "error_code": None,
+    }
+
+
 @app.post("/optimize/replacement")
 def optimize_replacement(input: CodeInput):
     syntax_error = check_syntax(input.code)
@@ -1472,6 +1586,9 @@ def optimize_replacement(input: CodeInput):
 
     engine = ReplacementEngine(input.function_name)
     optimized_function_code = engine.optimize(target_node)
+
+    if not engine.pattern_applied:
+        return build_ai_replacement_result(input, target_node, before_analysis)
 
     full_code = replace_function_code(
         input.code,
@@ -1503,13 +1620,181 @@ def optimize_replacement(input: CodeInput):
         "before": before_analysis,
         "after": after_analysis,
         "reason": engine.reason,
+        "optimization_source": "trusted_pattern",
+        "ai_used": False,
+        "verification_status": "trusted_pattern",
+        "pattern_applied": True,
+        "trusted_candidate_token": _trusted_candidate_token(input.code, optimized_function_code, input.function_name),
     }
     
+class CandidateVerificationInput(BaseModel):
+    original_code: str = Field(min_length=1, max_length=262144)
+    function_name: str = Field(min_length=1, max_length=128)
+    candidate_function_code: str = Field(min_length=1, max_length=65536)
+
+
+def _has_external_bindings(tree, function):
+    local = {p.arg for p in function.args.posonlyargs + function.args.args + function.args.kwonlyargs}
+    local |= {n.id for n in ast.walk(function) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    used = {n.id for statement in function.body for n in ast.walk(statement)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - local
+    bound = set()
+    for statement in tree.body:
+        if statement is function:
+            continue
+        bound |= {n.id for n in ast.walk(statement) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        if isinstance(statement, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
+            bound.add(statement.name)
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            bound |= {alias.asname or alias.name.split(".")[0] for alias in statement.names}
+    return bool(used & bound)
+
+
+def _function_api(node):
+    return (ast.dump(node.args),
+            ast.dump(node.returns) if node.returns else None,
+            tuple(ast.dump(item) for item in node.decorator_list),
+            tuple(ast.dump(item) for item in getattr(node, "type_params", [])))
+
+
+@app.post("/verify/candidate")
+def verify_candidate_endpoint(input: CandidateVerificationInput):
+    response = {
+        **VerificationResult().to_dict(),
+        "function": input.function_name,
+        "candidate_sha256": hashlib.sha256(input.candidate_function_code.encode("utf-8")).hexdigest(),
+        "original_sha256": hashlib.sha256(input.original_code.encode("utf-8")).hexdigest(),
+    }
+
+    def stop(status, reason):
+        return {**response, "verification_status": status, "reason": reason}
+
+    try:
+        original_tree = ast.parse(input.original_code)
+    except (SyntaxError, ValueError, RecursionError):
+        return stop("error", "The original code is not valid Python.")
+    matches = [node for node in ast.walk(original_tree)
+               if isinstance(node, ast.FunctionDef) and node.name == input.function_name]
+    if len(matches) != 1:
+        return stop("error", "Select one unambiguous original function.")
+    original_node = matches[0]
+    if _has_external_bindings(original_tree, original_node):
+        return stop("inconclusive", "Global dependencies are outside the supported verification scope.")
+    if original_node not in original_tree.body:
+        return stop("inconclusive", "APEX currently verifies standalone top-level functions only.")
+    try:
+        candidate_tree = ast.parse(input.candidate_function_code)
+        if len(candidate_tree.body) != 1 or not isinstance(candidate_tree.body[0], ast.FunctionDef):
+            return stop("rejected", "The candidate must contain exactly one Python function.")
+        candidate_node = candidate_tree.body[0]
+        if candidate_node.name != original_node.name:
+            return stop("rejected", "The candidate changed the function name.")
+        if _function_api(candidate_node) != _function_api(original_node):
+            return stop("rejected", "The candidate changed the function parameters or API.")
+    except (SyntaxError, ValueError, RecursionError):
+        return stop("rejected", "The candidate is not valid Python.")
+    # Decorators/context are not executed as a standalone behavioral check.
+    if original_node.decorator_list or getattr(original_node, "type_params", []):
+        return stop("inconclusive", "APEX could not generate a supported verification suite for this function.")
+    try:
+        original_function, _ = extract_selected_function_source(input.original_code, input.function_name)
+        response["before"] = analyze_function_node(input.function_name, original_node)
+        response["after"] = analyze_function_node(input.function_name, candidate_node)
+        candidate_full_code = replace_function_code(input.original_code, input.function_name, input.candidate_function_code)
+        ast.parse(candidate_full_code)
+        report = verify_with_docker(original_function, input.candidate_function_code,
+                                    input.function_name, case_limit=interactive_case_limit())
+    except Exception:
+        return stop("error", "Verification runtime is currently unavailable.")
+    # Expose counts and public explanations, never raw Docker/worker details.
+    for key in ("tests_total", "tests_available", "tests_run", "tests_passed", "tests_failed",
+                "tests_inconclusive", "tests_errors", "comparison_scope", "mutation_checks_performed",
+                "input_profile_source", "input_profiles"):
+        response[key] = getattr(report, key)
+    status = report.verification_status
+    if status == "verified" and (report.tests_available == 0 or report.tests_run == 0):
+        status = "inconclusive"
+    reasons = {
+        "verified": "Verified across the generated test cases within the supported verification scope.",
+        "rejected": "The candidate differed from the original on one or more behavioral tests.",
+        "inconclusive": "APEX could not establish a conclusive result across the supported verification cases.",
+        "error": "Verification runtime is currently unavailable.",
+    }
+    if status not in reasons:
+        status = "error"
+    if status == "inconclusive" and (report.tests_available == 0 or report.tests_run == 0):
+        reasons[status] = "APEX could not generate reliable behavioral test cases for this function signature."
+    response.update(verification_status=status, reason=reasons[status])
+    response["mismatches"] = [{"case_id": item.case_id, "kind": item.kind} for item in report.mismatches]
+    if status == "verified":
+        response["verified_full_code"] = candidate_full_code
+    return response
+
+
 #جديد
+_TRUSTED_CANDIDATE_KEY = secrets.token_bytes(32)
+
+
+def _trusted_candidate_token(original, optimized, name):
+    payload = json.dumps([original, optimized, name], ensure_ascii=False).encode("utf-8")
+    return hmac.new(_TRUSTED_CANDIDATE_KEY, payload, hashlib.sha256).hexdigest()
+
+
+class CandidateBenchmarkInput(CandidateVerificationInput):
+    trusted_candidate_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    optimization_source: Literal["ai", "trusted_pattern"] = "ai"
+    candidate_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+@app.post("/benchmark/candidate")
+def benchmark_candidate_endpoint(input: CandidateBenchmarkInput):
+    from benchmark import BenchmarkResult, benchmark_with_docker
+    failure = BenchmarkResult(input.function_name)
+    if input.optimization_source == "trusted_pattern" and not hmac.compare_digest(
+            input.trusted_candidate_token or "", _trusted_candidate_token(input.original_code, input.candidate_function_code, input.function_name)):
+        failure.reason = "The trusted candidate does not match a result issued by this server."
+        return failure.to_dict()
+    try:
+        fingerprint = hashlib.sha256(input.candidate_function_code.encode("utf-8")).hexdigest()
+        if input.candidate_fingerprint is not None and input.candidate_fingerprint != fingerprint:
+            failure.reason = "The candidate fingerprint does not match the submitted source."
+            return failure.to_dict()
+        tree = ast.parse(input.original_code)
+        matches = [node for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef) and node.name == input.function_name]
+        candidate = ast.parse(input.candidate_function_code)
+        if (len(matches) != 1 or matches[0] not in tree.body or len(candidate.body) != 1
+                or not isinstance(candidate.body[0], ast.FunctionDef)
+                or candidate.body[0].name != input.function_name
+                or _function_api(matches[0]) != _function_api(candidate.body[0])):
+            failure.reason = "Select matching standalone functions with an unchanged parameter API."
+            return failure.to_dict()
+        if _has_external_bindings(tree, matches[0]):
+            failure.reason = "Global dependencies are outside the supported verification scope."
+            return failure.to_dict()
+        original, _ = extract_selected_function_source(input.original_code, input.function_name)
+    except (SyntaxError, ValueError, UnicodeError, RecursionError):
+        failure.reason = "The submitted function sources are invalid."
+        return failure.to_dict()
+    try:
+        # Both sources use the submitted pair, never regenerate an optimization.
+        # AI retains fresh runtime verification; trusted patterns use direct measurement.
+        options = {"optimization_source": "trusted_pattern"} if input.optimization_source == "trusted_pattern" else {}
+        result = benchmark_with_docker(original, input.candidate_function_code, input.function_name, **options)
+        return result.to_dict()
+    except Exception:
+        failure.benchmark_status = "error"
+        failure.reason = "Benchmark runtime is currently unavailable."
+        return failure.to_dict()
+
+
 class SimulationInput(BaseModel):
     code: str
     function_name: str
     optimization_type: str = "replacement"
+    optimization_source: str | None = None
+    candidate_function_code: str | None = None
+    candidate_fingerprint: str | None = None
     start_n: int = 10
     end_n: int = 100
     step: int = 10
@@ -1686,7 +1971,34 @@ def simulate_code(input: SimulationInput):
     if optimization_type not in {"simple", "replacement"}:
         optimization_type = "replacement"
 
-    if optimization_type == "simple":
+    if input.optimization_source == "ai":
+        try:
+            source = input.candidate_function_code
+            if not source or len(source.encode("utf-8")) > 65536:
+                return {"error": "A candidate function is required for AI simulation."}
+            fingerprint = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            if input.candidate_fingerprint != fingerprint:
+                return {"error": "The candidate fingerprint does not match the submitted source."}
+            candidate_tree = ast.parse(source)
+            originals = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == input.function_name]
+            if (len(originals) != 1 or target_node not in tree.body or len(candidate_tree.body) != 1
+                    or not isinstance(candidate_tree.body[0], ast.FunctionDef)
+                    or candidate_tree.body[0].name != input.function_name
+                    or _function_api(target_node) != _function_api(candidate_tree.body[0])):
+                return {"error": "AI simulation requires matching standalone function APIs."}
+            result = {
+                "before": analyze_function_node(input.function_name, target_node),
+                "after": analyze_function_node(input.function_name, candidate_tree.body[0]),
+                "optimized_function_code": source,
+                "full_code": replace_function_code(input.code, input.function_name, source),
+                "changes": [], "optimization_source": "ai",
+                "candidate_fingerprint": fingerprint,
+                "original_sha256": hashlib.sha256(input.code.encode("utf-8")).hexdigest(),
+                "simulation_kind": "theoretical_complexity_projection",
+            }
+        except (SyntaxError, ValueError, TypeError, UnicodeError, RecursionError):
+            return {"error": "Invalid AI candidate source."}
+    elif optimization_type == "simple":
         result = build_simple_simulation_result(
             input,
             tree,
