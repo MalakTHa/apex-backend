@@ -43,6 +43,8 @@ BUILTIN_COMPLEXITIES = {
     "min": "O(n)",
     "max": "O(n)",
     "sum": "O(n)",
+    "set": "O(n)",
+    "list": "O(n)",
     "join": "O(n)",
     "split": "O(n)",
 }
@@ -81,6 +83,7 @@ class FunctionAnalyzer(ast.NodeVisitor):#يعني هنا الكلاس FunctionAn
         self.has_logarithmic_loop = False # NEW: Tracks if a loop divides data (Binary Search)
         self.max_effective_depth = 0
         self.current_call_depth = 0
+        self.sort_call_depth = 0
 
     def visit_FunctionDef(self, node):
         if not self.function_name:
@@ -95,6 +98,8 @@ class FunctionAnalyzer(ast.NodeVisitor):#يعني هنا الكلاس FunctionAn
             # Do NOT call generic_visit(node) here to avoid double-counting the body
 
     def visit_For(self, node):
+        # The iterable is evaluated once, before entering this loop.
+        self.visit(node.iter)
         self.loops += 1
         self.current_depth += 1
 
@@ -105,8 +110,12 @@ class FunctionAnalyzer(ast.NodeVisitor):#يعني هنا الكلاس FunctionAn
             self.nested_loops += 1
             self.has_nested_loops = True
 
-        self.generic_visit(node)
+        self.visit(node.target)
+        for statement in node.body:
+            self.visit(statement)
         self.current_depth -= 1
+        for statement in node.orelse:
+            self.visit(statement)
 
     def visit_While(self, node):
         self.loops += 1
@@ -178,7 +187,9 @@ class FunctionAnalyzer(ast.NodeVisitor):#يعني هنا الكلاس FunctionAn
                 comp = BUILTIN_COMPLEXITIES[func_name]
                 added_depth = 0
                 if comp == "O(n)": added_depth = 1
-                elif comp == "O(n log n)": added_depth = 1 # Simplified
+                elif comp == "O(n log n)":
+                    added_depth = 1
+                    self.sort_call_depth = max(self.sort_call_depth, self.current_depth + 1)
                 
                 effective_depth = self.current_depth + added_depth
                 if effective_depth > self.max_depth:
@@ -198,6 +209,9 @@ class FunctionAnalyzer(ast.NodeVisitor):#يعني هنا الكلاس FunctionAn
                 comp = BUILTIN_COMPLEXITIES[attr_name]
                 added_depth = 0
                 if comp == "O(n)": added_depth = 1
+                elif comp == "O(n log n)":
+                    added_depth = 1
+                    self.sort_call_depth = max(self.sort_call_depth, self.current_depth + 1)
                 effective_depth = self.current_depth + added_depth
                 if effective_depth > self.max_depth:
                     self.max_depth = effective_depth
@@ -353,6 +367,11 @@ def estimate_complexity(analyzer):# الان الباراميتر analyzer من 
         return "Recursive"
 
     # 🔴 Nested loops (dynamic handling)
+    # Retain the sorting logarithm when its polynomial order is dominant.
+    if analyzer.sort_call_depth and analyzer.sort_call_depth >= analyzer.max_depth:
+        polynomial = format_polynomial_complexity(analyzer.sort_call_depth)[2:-1]
+        return f"O({polynomial} log n)"
+
     if analyzer.max_depth >= 2:
         # Sorting pattern (swap-based) فقط إذا عمق = 2
         if analyzer.has_swap and analyzer.max_depth == 2:
@@ -379,7 +398,7 @@ def estimate_complexity(analyzer):# الان الباراميتر analyzer من 
         if analyzer.max_depth == 2:
             return "O(n log n)"
 
-    return "O(1)"
+    return format_polynomial_complexity(analyzer.max_depth)
 
 
 def estimate_space_complexity(analyzer):
