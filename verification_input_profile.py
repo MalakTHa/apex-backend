@@ -62,7 +62,7 @@ def unsupported_effects(node):
                 return "Global dependencies are outside the supported verification scope."
     return None
 
-def resolve_input_profiles(node):
+def resolve_input_profiles(node, *, behavioral=False):
     profiles = []
     for parameter in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
         if parameter.annotation is not None:
@@ -95,7 +95,75 @@ def resolve_input_profiles(node):
                              for n in ast.walk(node))
         if collection_use and "int" in types:
             types.add("conflicting_collection")
+        if behavioral:
+            types, extra = _behavioral_evidence(node, name, types, elements)
+            evidence.extend(extra)
         rebound = any(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store) for n in ast.walk(node))
         kind = next(iter(types)) if len(types) == 1 and not rebound else None
+        if kind in {"unsupported_sequence_use", "conflicting_collection", "conflicting_mutation"}:
+            kind = None
         profiles.append(InputProfile(name, kind, "ast_inference", "conservative" if kind else "insufficient", tuple(sorted(set(evidence))) or ("No unambiguous type evidence",), kind is not None))
     return profiles
+
+
+def _behavioral_evidence(node, name, types, elements):
+    """Select bounded representative domains only from compatible body evidence.
+
+    Iterable evidence alone does not determine an element domain. Ordering plus
+    mutable sequence operations supports homogeneous integer and string cases.
+    """
+    types = set(types)
+    evidence = []
+    named = lambda value: isinstance(value, ast.Name) and value.id == name
+    element = lambda value: (isinstance(value, ast.Subscript) and named(value.value)
+                             and not isinstance(value.slice, ast.Slice)) or (
+                                 isinstance(value, ast.Name) and value.id in elements)
+    nodes = list(ast.walk(node))
+    indexed = any(isinstance(n, ast.Subscript) and named(n.value) for n in nodes)
+    mutable = any(isinstance(n, ast.Subscript) and named(n.value)
+                  and isinstance(n.ctx, ast.Store) for n in nodes)
+    sized = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "len" and any(named(a) for a in n.args) for n in nodes)
+    ordered = False
+    uncertain = False
+    for child in nodes:
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+            if element(child.func.value) and child.func.attr in {
+                    "lower", "upper", "strip", "lstrip", "rstrip", "split",
+                    "startswith", "endswith", "isdigit", "isalpha", "replace"}:
+                types.add("list[str]")
+                evidence.append("String-specific method on sequence element")
+        if isinstance(child, (ast.BinOp, ast.Compare)):
+            values = [child.left, child.right] if isinstance(child, ast.BinOp) else [child.left, *child.comparators]
+            if isinstance(child, ast.Compare) and all(element(v) for v in values):
+                ordered = all(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)) for op in child.ops)
+            for predicate, kind in ((named, "int"), (element, "list[int]")):
+                if not any(predicate(v) for v in values):
+                    continue
+                if any(isinstance(v, ast.Constant) and isinstance(v.value, str) for v in values):
+                    types.add("str" if kind == "int" else "list[str]")
+                if isinstance(child, ast.BinOp):
+                    if isinstance(child.op, (ast.Sub, ast.Div, ast.FloorDiv, ast.Pow)):
+                        types.add(kind)
+                        evidence.append("Numeric arithmetic operation")
+                    elif not types and any(element(v) for v in values):
+                        uncertain = True
+        if isinstance(child, ast.Subscript) and named(child.value):
+            if isinstance(child.slice, ast.Constant) and type(child.slice.value) is not int:
+                uncertain = True
+    if elements:
+        evidence.append("Parameter is iterated")
+    if sized and indexed:
+        evidence.append("Length and indexing establish sequence use")
+    if mutable:
+        evidence.append("Item assignment requires a mutable sequence")
+    if not types and mutable and sized and indexed and ordered and not uncertain:
+        types.add("list[int] | list[str]")
+        evidence.append("Comparable mutable sequence: bounded homogeneous integer and string examples")
+    if (indexed or elements or sized) and "int" in types:
+        types.add("conflicting_collection")
+    if mutable and "str" in types:
+        types.add("conflicting_mutation")
+    if uncertain:
+        types.add("unsupported_sequence_use")
+    return types, evidence

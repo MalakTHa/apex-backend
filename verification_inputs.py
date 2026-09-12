@@ -26,6 +26,7 @@ class InputGenerationResult:
 def _values(type_name: str) -> list:
     # At most six examples per parameter, hence at most 36 cases per function.
     return {
+        "list[int] | list[str]": [[], [1, 1], [3, -1, 2], [""], ["a", "a"], ["b", "A", "a"]],
         "int": [0, 1, -1, 2, -2, 10],
         "str": ["", "a", "aa", "a b", "Ab!", "\u0645\u0631\u062d\u0628\u0627"],
         "list[int]": [[], [0], [1, 1], [3, 1, 2], [-2, 0, 2], [1, 2, 1]],
@@ -60,7 +61,7 @@ def generate_test_cases(function_node: ast.FunctionDef) -> InputGenerationResult
     effect = unsupported_effects(function_node)
     if effect:
         return InputGenerationResult("unsupported", effect)
-    profiles = resolve_input_profiles(function_node)
+    profiles = resolve_input_profiles(function_node, behavioral=True)
     types = [profile.inferred_type for profile in profiles]
     if any(type_name is None for type_name in types):
         return InputGenerationResult("unsupported", "APEX could not generate reliable behavioral test cases for this function signature.")

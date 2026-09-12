@@ -37,3 +37,14 @@ class PlatformDockerTests(unittest.TestCase):
         self.assertEqual(trusted['optimization_source'], 'trusted_pattern')
         self.assertEqual(trusted['verification_status'], 'trusted_pattern', trusted)
         print('Docker unannotated positive(items): verified using conservative AST inference.')
+
+    def test_unannotated_mutable_sequence_profiles(self):
+        original = BUBBLE.replace(": list[int]", "")
+        candidate = "def bubble_sort(items):\n    items.sort()\n    return items\n"
+        result = self.verify(original, candidate, "bubble_sort")
+        self.assertEqual(result["verification_status"], "verified", result)
+        self.assertEqual(result["tests_run"], 6)
+        self.assertEqual(result["mutation_checks_performed"], 6)
+        result = self.verify(original, SORTED.replace(": list[int]", ""), "bubble_sort")
+        self.assertEqual(result["verification_status"], "rejected", result)
+        self.assertTrue(any(m["kind"] == "input_mutation" for m in result["mismatches"]))

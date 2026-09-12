@@ -211,7 +211,7 @@ def verify_candidate(
         result.reason = "Sources must contain one matching synchronous function with an unchanged parameter API."
         return result
     try:
-        profiles = resolve_input_profiles(original_node)
+        profiles = resolve_input_profiles(original_node, behavioral=True)
         result.input_profiles = [profile.to_dict() for profile in profiles]
         result.input_profile_source = "ast_inference" if any(p.source == "ast_inference" for p in profiles) else "annotation"
         generation = generate_test_cases(original_node)
